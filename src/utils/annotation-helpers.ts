@@ -1,11 +1,89 @@
 // ============================================================================
 // ANNOTATION HELPERS - Annotation-specific utility functions
 // ============================================================================
+// Thin compatibility layer over the data-driven annotation generator.
+// The classification/label/hint logic now lives in ./annotation-generator;
+// this module preserves the historical `extractElementMetadata` shape and
+// adds the frame-level generation entry point.
+// ============================================================================
+
+import type { Annotation } from "../types";
+import {
+  buildFields,
+  collectFocusableElements,
+  type GenerateOptions,
+} from "./annotation-generator";
+
+export interface FrameInfo {
+  id: string;
+  name: string;
+  pageId: string;
+  pageName: string;
+}
 
 /**
- * Extract element metadata and generate intelligent defaults for annotations
+ * Assemble a complete Annotation from a node, deriving all accessibility
+ * fields via the generator. Shared by the single-select create flow and the
+ * frame-level auto-generate flow so field shape stays identical.
  */
-export function extractElementMetadata(element: SceneNode): {
+export function assembleAnnotation(
+  node: SceneNode,
+  id: number,
+  platform: "mobile" | "web",
+  frame: FrameInfo,
+  options: GenerateOptions = {}
+): Annotation {
+  const f = buildFields(node, options);
+  const now = Date.now();
+  return {
+    id,
+    frameId: frame.id,
+    frameName: frame.name,
+    pageId: frame.pageId,
+    pageName: frame.pageName,
+    platform,
+    elementId: node.id,
+    elementName: node.name || "Unnamed Element",
+    voicedPreview: f.voicedPreview,
+    targetElementId: node.id,
+    createdAt: now,
+    updatedAt: now,
+    mobile: {
+      ios: { label: f.label, value: f.value, trait: f.trait, hint: f.hintIOS },
+      android: {
+        label: `${f.label} (contentDescription)`,
+        value: f.value,
+        trait: f.trait,
+        hint: f.hintAndroid,
+      },
+    },
+    web: {
+      ariaLabel: f.label,
+      role: f.role,
+      ariaDescribedBy: "n/a",
+      tabIndex: id.toString(),
+    },
+  };
+}
+
+export {
+  classifyElement,
+  collectFocusableElements,
+  deriveLabel,
+  setGeneratorLocale,
+  getGeneratorLocale,
+  type Locale,
+  type RoleKey,
+} from "./annotation-generator";
+
+/**
+ * Extract element metadata and generate intelligent defaults for a single
+ * element. Kept for backward compatibility with the single-select create flow.
+ */
+export function extractElementMetadata(
+  element: SceneNode,
+  options: GenerateOptions = {}
+): {
   elementType: string;
   textContent: string;
   voicedPreview: string;
@@ -14,161 +92,31 @@ export function extractElementMetadata(element: SceneNode): {
   suggestedHintIOS: string;
   suggestedHintAndroid: string;
 } {
-  let elementTypeName = ""; // Human-readable element type name
-  let textContent = "";
-  let suggestedRole = "";
-  let suggestedTrait = "";
-  let suggestedHintIOS = ""; // iOS-specific hint
-  let suggestedHintAndroid = ""; // Android-specific hint
-
-  // Extract text content from the element
-  if (element.type === "TEXT") {
-    textContent = (element).characters;
-    elementTypeName = "Text";
-    suggestedRole = "text";
-    suggestedTrait = "Static Text";
-    suggestedHintIOS = "";
-    suggestedHintAndroid = "";
-  } else if (
-    element.type === "FRAME" ||
-    element.type === "COMPONENT" ||
-    element.type === "INSTANCE"
-  ) {
-    // Check if frame/component contains text
-    const textNodes = element.findAll((n) => n.type === "TEXT") as TextNode[];
-    if (textNodes.length > 0) {
-      textContent = textNodes.map((t) => t.characters).join(" ");
-    }
-
-    // Infer element type from name
-    const nameLower = element.name.toLowerCase();
-    if (nameLower.includes("button") || nameLower.includes("btn")) {
-      elementTypeName = "Button";
-      suggestedRole = "button";
-      suggestedTrait = "Button";
-      // iOS uses "open", Android uses "activate"
-      suggestedHintIOS = textContent
-        ? `Dobbelttrykk for å åpne ${textContent}`
-        : "Dobbelttrykk for å åpne";
-      suggestedHintAndroid = textContent
-        ? `Dobbelttrykk for å aktivere ${textContent}`
-        : "Dobbelttrykk for å aktivere";
-    } else if (
-      nameLower.includes("input") ||
-      nameLower.includes("field") ||
-      nameLower.includes("textbox")
-    ) {
-      elementTypeName = "Input Field";
-      suggestedRole = "textbox";
-      suggestedTrait = "Text Field";
-      suggestedHintIOS = textContent
-        ? `Skriv inn ${textContent}`
-        : "Skriv inn tekst";
-      suggestedHintAndroid = textContent
-        ? `Skriv inn ${textContent}`
-        : "Skriv inn tekst";
-    } else if (nameLower.includes("checkbox") || nameLower.includes("check")) {
-      elementTypeName = "Checkbox";
-      suggestedRole = "checkbox";
-      suggestedTrait = "Button";
-      suggestedHintIOS = "Dobbelttrykk for å velge eller fjerne valg";
-      suggestedHintAndroid = "Dobbelttrykk for å velge eller fjerne valg";
-    } else if (nameLower.includes("radio")) {
-      elementTypeName = "Radio Button";
-      suggestedRole = "radio";
-      suggestedTrait = "Button";
-      suggestedHintIOS = "Dobbelttrykk for å velge dette alternativet";
-      suggestedHintAndroid = "Dobbelttrykk for å velge dette alternativet";
-    } else if (nameLower.includes("switch") || nameLower.includes("toggle")) {
-      elementTypeName = "Switch";
-      suggestedRole = "switch";
-      suggestedTrait = "Button";
-      suggestedHintIOS = "Dobbelttrykk for å slå av eller på";
-      suggestedHintAndroid = "Dobbelttrykk for å slå av eller på";
-    } else if (
-      nameLower.includes("image") ||
-      nameLower.includes("img") ||
-      nameLower.includes("icon")
-    ) {
-      elementTypeName = "Image";
-      suggestedRole = "image";
-      suggestedTrait = "Image";
-      suggestedHintIOS = "";
-      suggestedHintAndroid = "";
-    } else if (nameLower.includes("link")) {
-      elementTypeName = "Link";
-      suggestedRole = "link";
-      suggestedTrait = "Link";
-      suggestedHintIOS = textContent
-        ? `Dobbelttrykk for å åpne ${textContent}`
-        : "Dobbelttrykk for å åpne lenke";
-      suggestedHintAndroid = textContent
-        ? `Dobbelttrykk for å åpne ${textContent}`
-        : "Dobbelttrykk for å åpne lenke";
-    } else if (
-      nameLower.includes("header") ||
-      nameLower.includes("heading") ||
-      nameLower.includes("title")
-    ) {
-      elementTypeName = "Heading";
-      suggestedRole = "heading";
-      suggestedTrait = "Header";
-      suggestedHintIOS = "";
-      suggestedHintAndroid = "";
-    } else {
-      elementTypeName = "Frame";
-      suggestedRole = "group";
-      suggestedTrait = "None";
-      suggestedHintIOS = "";
-      suggestedHintAndroid = "";
-    }
-  } else if (
-    element.type === "RECTANGLE" ||
-    element.type === "ELLIPSE" ||
-    element.type === "POLYGON" ||
-    element.type === "STAR" ||
-    element.type === "VECTOR"
-  ) {
-    elementTypeName = "Shape";
-    suggestedRole = "img";
-    suggestedTrait = "Image";
-    suggestedHintIOS = "";
-    suggestedHintAndroid = "";
-  } else if (element.type === "GROUP") {
-    const textNodes = element.findAll((n) => n.type === "TEXT") as TextNode[];
-    if (textNodes.length > 0) {
-      textContent = textNodes.map((t) => t.characters).join(" ");
-    }
-    elementTypeName = "Group";
-    suggestedRole = "group";
-    suggestedTrait = "None";
-    suggestedHintIOS = "";
-    suggestedHintAndroid = "";
-  } else {
-    // Fallback for any other node types
-    elementTypeName = element.type;
-    suggestedRole = "group";
-    suggestedTrait = "None";
-    suggestedHintIOS = "";
-    suggestedHintAndroid = "";
-  }
-
-  // Generate voiced preview based on extracted data
-  let voicedPreview = "";
-  if (textContent) {
-    voicedPreview = `"${textContent}. ${elementTypeName}."`;
-  } else {
-    voicedPreview = `"${element.name}. ${elementTypeName}."`;
-  }
-
+  const fields = buildFields(element, options);
   return {
-    elementType: elementTypeName,
-    textContent,
-    voicedPreview,
-    suggestedRole,
-    suggestedTrait,
-    suggestedHintIOS,
-    suggestedHintAndroid,
+    elementType: fields.elementType,
+    // `textContent` historically meant "the label-ish text"; map to label.
+    textContent: fields.value === "n/a" ? "" : fields.label,
+    voicedPreview: fields.voicedPreview,
+    suggestedRole: fields.role,
+    suggestedTrait: fields.trait,
+    suggestedHintIOS: fields.hintIOS,
+    suggestedHintAndroid: fields.hintAndroid,
   };
 }
 
+/**
+ * Generate annotation field drafts for every focusable element in a frame,
+ * in reading order. Each entry pairs the source node with its derived fields;
+ * the caller assembles full Annotation objects (assigning IDs, timestamps and
+ * the mobile/web split).
+ */
+export function generateFrameFieldDrafts(
+  frame: FrameNode | SectionNode,
+  options: GenerateOptions = {}
+): Array<{ node: SceneNode; fields: ReturnType<typeof buildFields> }> {
+  return collectFocusableElements(frame).map((node) => ({
+    node,
+    fields: buildFields(node, options),
+  }));
+}

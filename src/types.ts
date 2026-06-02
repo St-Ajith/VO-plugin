@@ -134,6 +134,9 @@ export interface PluginActionMessages {
 
   // Request re-sync with authoritative source (SA-03 state recovery)
   "request-resync": Record<string, never>;
+
+  // Auto-generate annotations for every focusable element in a frame
+  "GENERATE_FRAME": { frameId?: string; requestId?: string };
 }
 
 // ============================================================================
@@ -182,6 +185,11 @@ export interface ZoomToFrameHandler extends EventHandler {
 export interface CreateAnnotationHandler extends EventHandler {
   name: "CREATE_ANNOTATION";
   handler: (data?: { requestId?: string }) => void;
+}
+
+export interface GenerateFrameHandler extends EventHandler {
+  name: "GENERATE_FRAME";
+  handler: (data?: { frameId?: string; requestId?: string }) => void;
 }
 
 export interface UpdateAnnotationHandler extends EventHandler {

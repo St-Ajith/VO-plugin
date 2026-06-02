@@ -7,6 +7,7 @@ import {
   AnnotationsReorderedHandler,
   CanvasSyncCompleteHandler,
   CreateAnnotationHandler,
+  GenerateFrameHandler,
   DeleteAnnotationHandler,
   GetScreensHandler,
   InsertAnnotationsHandler,
@@ -36,7 +37,7 @@ import { AnnotationStore } from "./annotation-store";
 import { CanvasService } from "./canvas";
 import { FrameManager } from "./frame-manager";
 import { isAnnotationTable } from "../utils/figma-helpers";
-import { extractElementMetadata } from "../utils/annotation-helpers";
+import { assembleAnnotation, generateFrameFieldDrafts } from "../utils/annotation-helpers";
 import { emitValidated } from "../utils/event-helpers";
 import {
   validateNodeForAnnotation,
@@ -78,6 +79,7 @@ export class MessageRouter {
     // MUTATE operations: state-changing operations that must be serialized
     const mutateOperations = [
       "CREATE_ANNOTATION",
+      "GENERATE_FRAME",
       "UPDATE_ANNOTATION",
       "DELETE_ANNOTATION",
       "REORDER_ANNOTATION",
@@ -221,49 +223,12 @@ export class MessageRouter {
       await this.frameManager.selectFrame(frameInfo.id, false);
     }
     const annotationId = this.store.getNextId(frameInfo.id);
-    const elementName = annotationTarget.name || "Unnamed Element";
-    const metadata = extractElementMetadata(annotationTarget);
-    const label = metadata.textContent || elementName;
-    const value = metadata.textContent || "n/a";
-    const trait = metadata.suggestedTrait;
-    const role = metadata.suggestedRole;
-    const voicedPreview = metadata.voicedPreview;
-
-    const now = Date.now();
-    const annotation: Annotation = {
-      id: annotationId,
-      frameId: frameInfo.id,
-      frameName: frameInfo.name,
-      pageId: frameInfo.pageId,
-      pageName: frameInfo.pageName,
-      platform: this.currentPlatformRef.value,
-      elementId: annotationTarget.id,
-      elementName: elementName,
-      voicedPreview: voicedPreview,
-      targetElementId: annotationTarget.id, // Store the specific target element ID
-      createdAt: now,
-      updatedAt: now,
-      mobile: {
-        ios: {
-          label,
-          value,
-          trait,
-          hint: metadata.suggestedHintIOS,
-        },
-        android: {
-          label: `${label} (contentDescription)`,
-          value,
-          trait,
-          hint: metadata.suggestedHintAndroid,
-        },
-      },
-      web: {
-        ariaLabel: label,
-        role: role,
-        ariaDescribedBy: "n/a",
-        tabIndex: annotationId.toString(),
-      },
-    };
+    const annotation = assembleAnnotation(
+      annotationTarget,
+      annotationId,
+      this.currentPlatformRef.value,
+      frameInfo
+    );
 
     await this.store.add(annotation);
 
@@ -278,6 +243,82 @@ export class MessageRouter {
     );
 
     figma.notify(`✅ Annotation ${annotationId} created`);
+  }
+
+  /**
+   * Auto-generate one annotation per focusable element in a frame, in reading
+   * order. Reuses the shared assembler so generated annotations are identical
+   * in shape to single-created ones. Populates the store and refreshes the UI;
+   * the user then uses the existing Insert button to render canvas tables.
+   */
+  private async handleGenerateForFrame(frameId?: string): Promise<void> {
+    const targetFrameId = frameId || this.frameManager.getCurrentFrameId();
+    if (!targetFrameId) {
+      figma.notify("❌ Select a frame first to generate annotations.");
+      return;
+    }
+
+    const frameNode = await figma.getNodeByIdAsync(targetFrameId);
+    if (
+      !frameNode ||
+      frameNode.removed ||
+      (frameNode.type !== "FRAME" && frameNode.type !== "SECTION")
+    ) {
+      figma.notify("❌ Could not find the selected frame.");
+      return;
+    }
+
+    const frame = frameNode;
+    const frameInfo = {
+      id: frame.id,
+      name: frame.name,
+      pageId: frame.parent?.id || "",
+      pageName: frame.parent?.name || "",
+    };
+
+    await this.frameManager.selectFrame(frame.id, false);
+
+    const drafts = generateFrameFieldDrafts(frame);
+    if (drafts.length === 0) {
+      figma.notify("No focusable elements found in this frame.");
+      return;
+    }
+
+    let created = 0;
+    for (const { node } of drafts) {
+      try {
+        const id = this.store.getNextId(frame.id);
+        const annotation = assembleAnnotation(
+          node,
+          id,
+          this.currentPlatformRef.value,
+          frameInfo
+        );
+        await this.store.add(annotation);
+        created++;
+      } catch (error) {
+        Logger.warn("Generate frame", "Failed to add generated annotation", {
+          nodeId: node.id,
+          error,
+        });
+      }
+    }
+
+    // Refresh the UI with the authoritative list (no per-item stale checks).
+    const screens = await this.frameManager.getAllAvailableFrames();
+    emit<InitHandler>("INIT", {
+      annotations: this.store.getAll(),
+      screens,
+      currentFrameId: frame.id,
+      selectionScope: this.selectionScopeRef.value,
+    });
+
+    Logger.info("Generate frame", "Generated annotations", {
+      frameId: frame.id,
+      created,
+      candidates: drafts.length,
+    });
+    figma.notify(`✅ Generated ${created} annotation${created === 1 ? "" : "s"}`);
   }
 
   private async handleUpdateAnnotations(): Promise<void> {
@@ -815,6 +856,37 @@ export class MessageRouter {
       }
     );
     cleanups.push(cleanupCreateAnnotation);
+
+    // GENERATE_FRAME handler - auto-generate annotations for a whole frame
+    const cleanupGenerateFrame = on<GenerateFrameHandler>(
+      "GENERATE_FRAME",
+      (data) => {
+        void (async () => {
+          const requestId = data?.requestId;
+          try {
+            if (isDuplicateRequest(requestId)) {
+              Logger.warn("Generate frame", "Duplicate request detected, skipping", {
+                requestId,
+              });
+              return;
+            }
+            markRequestProcessed(requestId);
+
+            const wrappedHandler = this.wrapHandler(
+              "GENERATE_FRAME",
+              async () => {
+                await this.handleGenerateForFrame(data?.frameId);
+              }
+            );
+            await wrappedHandler();
+          } catch (error) {
+            Logger.error("Generate frame handler", error);
+            figma.notify("❌ Failed to generate annotations", { error: true });
+          }
+        })();
+      }
+    );
+    cleanups.push(cleanupGenerateFrame);
 
     // UPDATE_ANNOTATION handler
     const cleanupUpdateAnnotation = on<UpdateAnnotationHandler>(
