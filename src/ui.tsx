@@ -21,6 +21,7 @@ import { organizeFramesByPages } from './ui/frame-utils'
 import {
   Annotation,
   CreateAnnotationHandler,
+  GenerateFrameHandler,
   GetScreensHandler,
   InsertAnnotationsHandler,
   PluginActionMessages,
@@ -250,6 +251,18 @@ function Plugin() {
     })
     
     emit<CreateAnnotationHandler>('CREATE_ANNOTATION', { requestId })
+  }
+
+  const handleGenerateFrame = () => {
+    if (isSyncing.value || !currentFrameId.value) {
+      Logger.debug('UI', 'Generate blocked - no frame or sync in progress')
+      return
+    }
+    Logger.info('UI', 'Generate-for-frame requested', { frameId: currentFrameId.value })
+    emit<GenerateFrameHandler>('GENERATE_FRAME', {
+      frameId: currentFrameId.value,
+      requestId: generateRequestId(),
+    })
   }
 
   const handleUpdateAnnotation = (id: number, data: Partial<Annotation>) => {
@@ -515,6 +528,22 @@ function Plugin() {
             }}
           >
             Add Annotation
+          </button>
+
+          <button
+            style={{
+              ...styles.addAnnotationButton,
+              backgroundColor: 'transparent',
+              color: styles.addAnnotationButton.backgroundColor,
+              border: `1px solid ${styles.addAnnotationButton.backgroundColor}`,
+              marginTop: '8px',
+              ...((!currentFrameId || isSyncing.value) ? styles.addAnnotationButtonDisabled : {})
+            }}
+            onClick={handleGenerateFrame}
+            disabled={!currentFrameId || isSyncing.value}
+            title="Scan the selected frame and generate one annotation per focusable element, in reading order"
+          >
+            ✨ Generate for frame
           </button>
         </div>
 
