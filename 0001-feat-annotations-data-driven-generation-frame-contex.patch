@@ -1,0 +1,1362 @@
+From 8ce3c1054b777800f542db610aa0fec799abef10 Mon Sep 17 00:00:00 2001
+From: VO Plugin <you@example.com>
+Date: Tue, 2 Jun 2026 22:44:33 +0000
+Subject: [PATCH] feat(annotations): data-driven generation + frame-context
+ auto-generate
+
+Replace the layer-name if/else inference with a single data-driven engine
+and add frame-level annotation generation.
+
+- annotation-generator.ts: ROLE_TABLE (roles as data), classifyElement with
+  signal priority (vo-label-trait tag > component/name keyword > structure),
+  deriveLabel (first text in reading order, not all text joined), locale hint
+  packs (nb + en) replacing hardcoded strings, and collectFocusableElements
+  to walk a frame and emit focusable elements in reading order.
+- annotation-helpers.ts: thin delegating layer; preserves extractElementMetadata
+  signature; adds shared assembleAnnotation and generateFrameFieldDrafts.
+- message-router.ts: single-create now uses assembleAnnotation (removes inline
+  literal); adds GENERATE_FRAME handler (queued MUTATE, dedup-guarded).
+- ui.tsx: "Generate for frame" button.
+- types.ts: GenerateFrameHandler + GENERATE_FRAME action message.
+- tests: 20 unit tests for the generator (classification, labels, locale
+  hints, reading order, frame walk). Full suite 401 passing; lint + typecheck
+  clean; production build succeeds.
+---
+ .../utils/annotation-generator.test.ts        | 247 +++++++++
+ src/services/message-router.ts                | 160 ++++--
+ src/types.ts                                  |   8 +
+ src/ui.tsx                                    |  29 +
+ src/utils/annotation-generator.ts             | 498 ++++++++++++++++++
+ src/utils/annotation-helpers.ts               | 260 ++++-----
+ 6 files changed, 1002 insertions(+), 200 deletions(-)
+ create mode 100644 src/__tests__/utils/annotation-generator.test.ts
+ create mode 100644 src/utils/annotation-generator.ts
+
+diff --git a/src/__tests__/utils/annotation-generator.test.ts b/src/__tests__/utils/annotation-generator.test.ts
+new file mode 100644
+index 0000000..ac3e4aa
+--- /dev/null
++++ b/src/__tests__/utils/annotation-generator.test.ts
+@@ -0,0 +1,247 @@
++import { describe, it, expect, beforeEach } from "vitest";
++import {
++  classifyElement,
++  deriveLabel,
++  buildFields,
++  collectFocusableElements,
++  readingOrderComparator,
++  setGeneratorLocale,
++} from "../../utils/annotation-generator";
++
++// ----------------------------------------------------------------------------
++// Lightweight fixtures (no figma global, no heavy mocks needed)
++// ----------------------------------------------------------------------------
++
++interface NodeInit {
++  id?: string;
++  name: string;
++  type: string;
++  characters?: string;
++  visible?: boolean;
++  x?: number;
++  y?: number;
++  width?: number;
++  height?: number;
++  fills?: Array<{ type: string; visible?: boolean }>;
++  children?: SceneNode[];
++}
++
++let counter = 0;
++
++function node(init: NodeInit): SceneNode {
++  const id = init.id ?? `n${counter++}`;
++  const x = init.x ?? 0;
++  const y = init.y ?? 0;
++  const width = init.width ?? 50;
++  const height = init.height ?? 20;
++
++  const base: Record<string, unknown> = {
++    id,
++    name: init.name,
++    type: init.type,
++    visible: init.visible ?? true,
++    x,
++    y,
++    width,
++    height,
++    absoluteBoundingBox: { x, y, width, height },
++  };
++
++  if (init.type === "TEXT") base.characters = init.characters ?? "";
++  if (init.fills) base.fills = init.fills;
++
++  if (init.children) {
++    const children = init.children;
++    base.children = children;
++    // Recursive findAll, mirroring Figma's descendant search.
++    base.findAll = (predicate?: (n: SceneNode) => boolean): SceneNode[] => {
++      const out: SceneNode[] = [];
++      const walk = (n: SceneNode) => {
++        if (!predicate || predicate(n)) out.push(n);
++        const kids = (n as unknown as { children?: SceneNode[] }).children;
++        if (kids) kids.forEach(walk);
++      };
++      children.forEach(walk);
++      return out;
++    };
++  }
++
++  return base as unknown as SceneNode;
++}
++
++beforeEach(() => {
++  counter = 0;
++  setGeneratorLocale("nb");
++});
++
++// ----------------------------------------------------------------------------
++// classifyElement — signal priority
++// ----------------------------------------------------------------------------
++
++describe("classifyElement", () => {
++  it("prefers an explicit vo-label-trait tag over everything", () => {
++    const cls = classifyElement(node({ name: "vo-label-trait Back Button", type: "FRAME" }));
++    expect(cls.source).toBe("tag");
++    expect(cls.taggedLabel).toBe("Back");
++    expect(cls.taggedTrait).toBe("Button");
++    expect(cls.role).toBe("button");
++  });
++
++  it("classifies a plain text node as static text", () => {
++    const cls = classifyElement(node({ name: "Label", type: "TEXT", characters: "Hi" }));
++    expect(cls.role).toBe("text");
++    expect(cls.source).toBe("text");
++  });
++
++  it("treats a text node named like a title as a heading", () => {
++    const cls = classifyElement(node({ name: "Page Title", type: "TEXT", characters: "Welcome" }));
++    expect(cls.role).toBe("heading");
++  });
++
++  it("uses the component name as a trusted signal", () => {
++    const cls = classifyElement(node({ name: "Button/Primary", type: "INSTANCE" }));
++    expect(cls.role).toBe("button");
++    expect(cls.source).toBe("component");
++  });
++
++  it("matches the most specific role first (switch before button)", () => {
++    expect(classifyElement(node({ name: "Toggle Switch", type: "FRAME" })).role).toBe("switch");
++    expect(classifyElement(node({ name: "Checkbox row", type: "FRAME" })).role).toBe("checkbox");
++  });
++
++  it("falls back to image for vector-ish shapes", () => {
++    expect(classifyElement(node({ name: "Frame 12", type: "VECTOR" })).role).toBe("image");
++  });
++
++  it("infers image from a visible image fill on an unstructured node", () => {
++    const cls = classifyElement(
++      node({ name: "Frame 31", type: "RECTANGLE", fills: [{ type: "IMAGE" }] })
++    );
++    expect(cls.role).toBe("image");
++  });
++
++  it("falls back to group for an unstructured container", () => {
++    expect(classifyElement(node({ name: "Frame 99", type: "FRAME" })).role).toBe("group");
++  });
++});
++
++// ----------------------------------------------------------------------------
++// deriveLabel — one meaningful label, never all text joined
++// ----------------------------------------------------------------------------
++
++describe("deriveLabel", () => {
++  it("returns the tag label when tagged", () => {
++    expect(deriveLabel(node({ name: "vo-label-trait Submit Button", type: "FRAME" }))).toBe("Submit");
++  });
++
++  it("returns a text node's own characters", () => {
++    expect(deriveLabel(node({ name: "x", type: "TEXT", characters: "  Hello  " }))).toBe("Hello");
++  });
++
++  it("uses the FIRST text in reading order, not every text joined", () => {
++    const container = node({
++      name: "Frame 4",
++      type: "FRAME",
++      children: [
++        node({ name: "sub", type: "TEXT", characters: "Subtitle", y: 40 }),
++        node({ name: "title", type: "TEXT", characters: "Title", y: 0 }),
++      ],
++    });
++    expect(deriveLabel(container)).toBe("Title");
++  });
++
++  it("returns empty string for an auto-generated junk name with no text", () => {
++    expect(deriveLabel(node({ name: "Frame 12", type: "FRAME", children: [] }))).toBe("");
++  });
++});
++
++// ----------------------------------------------------------------------------
++// buildFields — assembled output + locale-driven hints
++// ----------------------------------------------------------------------------
++
++describe("buildFields", () => {
++  it("builds a Norwegian button hint by default", () => {
++    const f = buildFields(node({ name: "Button", type: "INSTANCE", characters: "" , children: [node({ name: "t", type: "TEXT", characters: "Buy" })]}));
++    expect(f.trait).toBe("Button");
++    expect(f.role).toBe("button");
++    expect(f.hintIOS).toContain("Dobbelttrykk");
++    expect(f.hintIOS).toContain("Buy");
++    expect(f.value).toBe("n/a");
++  });
++
++  it("emits English hints when the locale is switched", () => {
++    setGeneratorLocale("en");
++    const f = buildFields(node({ name: "Button", type: "INSTANCE" }));
++    expect(f.hintIOS).toContain("Double-tap");
++  });
++
++  it("respects a per-call locale override", () => {
++    const f = buildFields(node({ name: "Link", type: "FRAME" }), { locale: "en" });
++    expect(f.hintIOS).toContain("Double-tap");
++  });
++
++  it("sets value to the label for textual roles and adds no hint", () => {
++    const f = buildFields(node({ name: "x", type: "TEXT", characters: "Read me" }));
++    expect(f.value).toBe("Read me");
++    expect(f.hintIOS).toBe("");
++  });
++
++  it("gives images a trait but no hint", () => {
++    const f = buildFields(node({ name: "icon-home", type: "FRAME" }));
++    expect(f.trait).toBe("Image");
++    expect(f.hintIOS).toBe("");
++  });
++});
++
++// ----------------------------------------------------------------------------
++// reading order + frame walk
++// ----------------------------------------------------------------------------
++
++describe("reading order", () => {
++  it("orders top-to-bottom then left-to-right within a row", () => {
++    const a = node({ name: "a", type: "TEXT", characters: "a", x: 100, y: 0 });
++    const b = node({ name: "b", type: "TEXT", characters: "b", x: 0, y: 0 });
++    const c = node({ name: "c", type: "TEXT", characters: "c", x: 0, y: 50 });
++    const sorted = [a, c, b].sort(readingOrderComparator).map((n) => n.name);
++    expect(sorted).toEqual(["b", "a", "c"]);
++  });
++});
++
++describe("collectFocusableElements", () => {
++  it("walks structural containers but emits concrete elements as single units", () => {
++    const button = node({
++      name: "Button/Primary",
++      type: "INSTANCE",
++      y: 100,
++      children: [
++        node({ name: "icon", type: "VECTOR" }),
++        node({ name: "label", type: "TEXT", characters: "Save" }),
++      ],
++    });
++    const heading = node({ name: "title", type: "TEXT", characters: "Settings", y: 0 });
++    const card = node({
++      name: "Frame 7", // structural → recurse
++      type: "FRAME",
++      children: [heading, button],
++    });
++    const frame = node({ name: "Screen", type: "FRAME", children: [card] }) as unknown as FrameNode;
++
++    const result = collectFocusableElements(frame);
++    // Heading first (y:0), then the button as a single unit — NOT its icon/label.
++    expect(result.map((n) => n.name)).toEqual(["title", "Button/Primary"]);
++  });
++
++  it("skips hidden nodes and plugin scaffolding", () => {
++    const frame = node({
++      name: "Screen",
++      type: "FRAME",
++      children: [
++        node({ name: "hidden btn", type: "INSTANCE", visible: false }),
++        node({ name: "Annotation Table 1 - 123:4", type: "FRAME" }),
++        node({ name: "visible label", type: "TEXT", characters: "Hi" }),
++      ],
++    }) as unknown as FrameNode;
++
++    expect(collectFocusableElements(frame).map((n) => n.name)).toEqual(["visible label"]);
++  });
++});
+diff --git a/src/services/message-router.ts b/src/services/message-router.ts
+index 861100b..74cab37 100644
+--- a/src/services/message-router.ts
++++ b/src/services/message-router.ts
+@@ -7,6 +7,7 @@ import {
+   AnnotationsReorderedHandler,
+   CanvasSyncCompleteHandler,
+   CreateAnnotationHandler,
++  GenerateFrameHandler,
+   DeleteAnnotationHandler,
+   GetScreensHandler,
+   InsertAnnotationsHandler,
+@@ -36,7 +37,7 @@ import { AnnotationStore } from "./annotation-store";
+ import { CanvasService } from "./canvas";
+ import { FrameManager } from "./frame-manager";
+ import { isAnnotationTable } from "../utils/figma-helpers";
+-import { extractElementMetadata } from "../utils/annotation-helpers";
++import { assembleAnnotation, generateFrameFieldDrafts } from "../utils/annotation-helpers";
+ import { emitValidated } from "../utils/event-helpers";
+ import {
+   validateNodeForAnnotation,
+@@ -78,6 +79,7 @@ export class MessageRouter {
+     // MUTATE operations: state-changing operations that must be serialized
+     const mutateOperations = [
+       "CREATE_ANNOTATION",
++      "GENERATE_FRAME",
+       "UPDATE_ANNOTATION",
+       "DELETE_ANNOTATION",
+       "REORDER_ANNOTATION",
+@@ -221,49 +223,12 @@ export class MessageRouter {
+       await this.frameManager.selectFrame(frameInfo.id, false);
+     }
+     const annotationId = this.store.getNextId(frameInfo.id);
+-    const elementName = annotationTarget.name || "Unnamed Element";
+-    const metadata = extractElementMetadata(annotationTarget);
+-    const label = metadata.textContent || elementName;
+-    const value = metadata.textContent || "n/a";
+-    const trait = metadata.suggestedTrait;
+-    const role = metadata.suggestedRole;
+-    const voicedPreview = metadata.voicedPreview;
+-
+-    const now = Date.now();
+-    const annotation: Annotation = {
+-      id: annotationId,
+-      frameId: frameInfo.id,
+-      frameName: frameInfo.name,
+-      pageId: frameInfo.pageId,
+-      pageName: frameInfo.pageName,
+-      platform: this.currentPlatformRef.value,
+-      elementId: annotationTarget.id,
+-      elementName: elementName,
+-      voicedPreview: voicedPreview,
+-      targetElementId: annotationTarget.id, // Store the specific target element ID
+-      createdAt: now,
+-      updatedAt: now,
+-      mobile: {
+-        ios: {
+-          label,
+-          value,
+-          trait,
+-          hint: metadata.suggestedHintIOS,
+-        },
+-        android: {
+-          label: `${label} (contentDescription)`,
+-          value,
+-          trait,
+-          hint: metadata.suggestedHintAndroid,
+-        },
+-      },
+-      web: {
+-        ariaLabel: label,
+-        role: role,
+-        ariaDescribedBy: "n/a",
+-        tabIndex: annotationId.toString(),
+-      },
+-    };
++    const annotation = assembleAnnotation(
++      annotationTarget,
++      annotationId,
++      this.currentPlatformRef.value,
++      frameInfo
++    );
+ 
+     await this.store.add(annotation);
+ 
+@@ -280,6 +245,82 @@ export class MessageRouter {
+     figma.notify(`✅ Annotation ${annotationId} created`);
+   }
+ 
++  /**
++   * Auto-generate one annotation per focusable element in a frame, in reading
++   * order. Reuses the shared assembler so generated annotations are identical
++   * in shape to single-created ones. Populates the store and refreshes the UI;
++   * the user then uses the existing Insert button to render canvas tables.
++   */
++  private async handleGenerateForFrame(frameId?: string): Promise<void> {
++    const targetFrameId = frameId || this.frameManager.getCurrentFrameId();
++    if (!targetFrameId) {
++      figma.notify("❌ Select a frame first to generate annotations.");
++      return;
++    }
++
++    const frameNode = await figma.getNodeByIdAsync(targetFrameId);
++    if (
++      !frameNode ||
++      frameNode.removed ||
++      (frameNode.type !== "FRAME" && frameNode.type !== "SECTION")
++    ) {
++      figma.notify("❌ Could not find the selected frame.");
++      return;
++    }
++
++    const frame = frameNode;
++    const frameInfo = {
++      id: frame.id,
++      name: frame.name,
++      pageId: frame.parent?.id || "",
++      pageName: frame.parent?.name || "",
++    };
++
++    await this.frameManager.selectFrame(frame.id, false);
++
++    const drafts = generateFrameFieldDrafts(frame);
++    if (drafts.length === 0) {
++      figma.notify("No focusable elements found in this frame.");
++      return;
++    }
++
++    let created = 0;
++    for (const { node } of drafts) {
++      try {
++        const id = this.store.getNextId(frame.id);
++        const annotation = assembleAnnotation(
++          node,
++          id,
++          this.currentPlatformRef.value,
++          frameInfo
++        );
++        await this.store.add(annotation);
++        created++;
++      } catch (error) {
++        Logger.warn("Generate frame", "Failed to add generated annotation", {
++          nodeId: node.id,
++          error,
++        });
++      }
++    }
++
++    // Refresh the UI with the authoritative list (no per-item stale checks).
++    const screens = await this.frameManager.getAllAvailableFrames();
++    emit<InitHandler>("INIT", {
++      annotations: this.store.getAll(),
++      screens,
++      currentFrameId: frame.id,
++      selectionScope: this.selectionScopeRef.value,
++    });
++
++    Logger.info("Generate frame", "Generated annotations", {
++      frameId: frame.id,
++      created,
++      candidates: drafts.length,
++    });
++    figma.notify(`✅ Generated ${created} annotation${created === 1 ? "" : "s"}`);
++  }
++
+   private async handleUpdateAnnotations(): Promise<void> {
+     const frameId = this.frameManager.getCurrentFrameId();
+     if (!frameId) {
+@@ -816,6 +857,37 @@ export class MessageRouter {
+     );
+     cleanups.push(cleanupCreateAnnotation);
+ 
++    // GENERATE_FRAME handler - auto-generate annotations for a whole frame
++    const cleanupGenerateFrame = on<GenerateFrameHandler>(
++      "GENERATE_FRAME",
++      (data) => {
++        void (async () => {
++          const requestId = data?.requestId;
++          try {
++            if (isDuplicateRequest(requestId)) {
++              Logger.warn("Generate frame", "Duplicate request detected, skipping", {
++                requestId,
++              });
++              return;
++            }
++            markRequestProcessed(requestId);
++
++            const wrappedHandler = this.wrapHandler(
++              "GENERATE_FRAME",
++              async () => {
++                await this.handleGenerateForFrame(data?.frameId);
++              }
++            );
++            await wrappedHandler();
++          } catch (error) {
++            Logger.error("Generate frame handler", error);
++            figma.notify("❌ Failed to generate annotations", { error: true });
++          }
++        })();
++      }
++    );
++    cleanups.push(cleanupGenerateFrame);
++
+     // UPDATE_ANNOTATION handler
+     const cleanupUpdateAnnotation = on<UpdateAnnotationHandler>(
+       "UPDATE_ANNOTATION",
+diff --git a/src/types.ts b/src/types.ts
+index 9c124f5..2315331 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -134,6 +134,9 @@ export interface PluginActionMessages {
+ 
+   // Request re-sync with authoritative source (SA-03 state recovery)
+   "request-resync": Record<string, never>;
++
++  // Auto-generate annotations for every focusable element in a frame
++  "GENERATE_FRAME": { frameId?: string; requestId?: string };
+ }
+ 
+ // ============================================================================
+@@ -184,6 +187,11 @@ export interface CreateAnnotationHandler extends EventHandler {
+   handler: (data?: { requestId?: string }) => void;
+ }
+ 
++export interface GenerateFrameHandler extends EventHandler {
++  name: "GENERATE_FRAME";
++  handler: (data?: { frameId?: string; requestId?: string }) => void;
++}
++
+ export interface UpdateAnnotationHandler extends EventHandler {
+   name: "UPDATE_ANNOTATION";
+   handler: (data: Partial<Annotation> & { id: number; requestId?: string }) => void;
+diff --git a/src/ui.tsx b/src/ui.tsx
+index 90251b6..cc81f9e 100644
+--- a/src/ui.tsx
++++ b/src/ui.tsx
+@@ -21,6 +21,7 @@ import { organizeFramesByPages } from './ui/frame-utils'
+ import {
+   Annotation,
+   CreateAnnotationHandler,
++  GenerateFrameHandler,
+   GetScreensHandler,
+   InsertAnnotationsHandler,
+   PluginActionMessages,
+@@ -252,6 +253,18 @@ function Plugin() {
+     emit<CreateAnnotationHandler>('CREATE_ANNOTATION', { requestId })
+   }
+ 
++  const handleGenerateFrame = () => {
++    if (isSyncing.value || !currentFrameId.value) {
++      Logger.debug('UI', 'Generate blocked - no frame or sync in progress')
++      return
++    }
++    Logger.info('UI', 'Generate-for-frame requested', { frameId: currentFrameId.value })
++    emit<GenerateFrameHandler>('GENERATE_FRAME', {
++      frameId: currentFrameId.value,
++      requestId: generateRequestId(),
++    })
++  }
++
+   const handleUpdateAnnotation = (id: number, data: Partial<Annotation>) => {
+     // SA-03: Suppress actions during re-sync to prevent echo loop
+     if (isSyncing.value) {
+@@ -516,6 +529,22 @@ function Plugin() {
+           >
+             Add Annotation
+           </button>
++
++          <button
++            style={{
++              ...styles.addAnnotationButton,
++              backgroundColor: 'transparent',
++              color: styles.addAnnotationButton.backgroundColor,
++              border: `1px solid ${styles.addAnnotationButton.backgroundColor}`,
++              marginTop: '8px',
++              ...((!currentFrameId || isSyncing.value) ? styles.addAnnotationButtonDisabled : {})
++            }}
++            onClick={handleGenerateFrame}
++            disabled={!currentFrameId || isSyncing.value}
++            title="Scan the selected frame and generate one annotation per focusable element, in reading order"
++          >
++            ✨ Generate for frame
++          </button>
+         </div>
+ 
+         <AnnotationList
+diff --git a/src/utils/annotation-generator.ts b/src/utils/annotation-generator.ts
+new file mode 100644
+index 0000000..db73046
+--- /dev/null
++++ b/src/utils/annotation-generator.ts
+@@ -0,0 +1,498 @@
++// ============================================================================
++// ANNOTATION GENERATOR - Frame-context-aware annotation generation
++// ============================================================================
++// Reads a Figma element (or walks a whole frame) and derives accessibility
++// metadata for VoiceOver / TalkBack / ARIA.
++//
++// Design goals:
++//  - Data-driven: roles live in a single ROLE_TABLE, not an if/else chain.
++//  - Signal priority: explicit tag > component/name keyword > structure/text.
++//  - Localisable: hint copy lives in HINT_PACKS keyed by locale, not in logic.
++//  - Frame-first: collectFocusableElements() walks a frame and returns the
++//    elements that each deserve their own annotation, in reading order.
++// ============================================================================
++
++import { parseTaggedName, isAnnotationTable } from "./figma-helpers";
++
++// ----------------------------------------------------------------------------
++// Types
++// ----------------------------------------------------------------------------
++
++export type RoleKey =
++  | "button"
++  | "link"
++  | "input"
++  | "checkbox"
++  | "radio"
++  | "switch"
++  | "image"
++  | "heading"
++  | "text"
++  | "group";
++
++export type Locale = "nb" | "en";
++
++export type ClassificationSource =
++  | "tag" // matched vo-label-trait naming convention
++  | "component" // COMPONENT / INSTANCE name keyword
++  | "name" // layer name keyword
++  | "structure" // inferred from node type / fills
++  | "text"; // plain text node
++
++export interface RoleDefinition {
++  /** Human-readable type name used in the voiced preview. */
++  typeName: string;
++  /** VoiceOver / TalkBack trait. */
++  trait: string;
++  /** ARIA role for the web platform. */
++  webRole: string;
++  /** Keywords matched (case-insensitive substring) against a node name. */
++  keywords: string[];
++  /** Whether this role is an interactive control (controls get a hint). */
++  interactive: boolean;
++}
++
++export interface ElementClassification {
++  role: RoleKey;
++  /** Explicit label from a tag, when present (overrides derived label). */
++  taggedLabel?: string;
++  /** Explicit trait from a tag, when present (overrides table trait). */
++  taggedTrait?: string;
++  source: ClassificationSource;
++}
++
++export interface GeneratedFields {
++  elementType: string;
++  label: string;
++  value: string;
++  trait: string;
++  role: string;
++  hintIOS: string;
++  hintAndroid: string;
++  voicedPreview: string;
++}
++
++export interface GenerateOptions {
++  locale?: Locale;
++}
++
++// ----------------------------------------------------------------------------
++// Role table (single source of truth — replaces the old if/else chain)
++// ----------------------------------------------------------------------------
++// Order matters: classification scans this list top-to-bottom, so more
++// specific roles (switch, checkbox, radio) must precede broader ones.
++
++const ROLE_TABLE: Record<RoleKey, RoleDefinition> = {
++  switch: {
++    typeName: "Switch",
++    trait: "Button",
++    webRole: "switch",
++    keywords: ["switch", "toggle"],
++    interactive: true,
++  },
++  checkbox: {
++    typeName: "Checkbox",
++    trait: "Button",
++    webRole: "checkbox",
++    keywords: ["checkbox", "check"],
++    interactive: true,
++  },
++  radio: {
++    typeName: "Radio Button",
++    trait: "Button",
++    webRole: "radio",
++    keywords: ["radio"],
++    interactive: true,
++  },
++  input: {
++    typeName: "Input Field",
++    trait: "Text Field",
++    webRole: "textbox",
++    keywords: ["input", "field", "textbox", "textfield", "search"],
++    interactive: true,
++  },
++  button: {
++    typeName: "Button",
++    trait: "Button",
++    webRole: "button",
++    keywords: ["button", "btn", "cta"],
++    interactive: true,
++  },
++  link: {
++    typeName: "Link",
++    trait: "Link",
++    webRole: "link",
++    keywords: ["link", "anchor"],
++    interactive: true,
++  },
++  heading: {
++    typeName: "Heading",
++    trait: "Header",
++    webRole: "heading",
++    keywords: ["header", "heading", "title", "headline"],
++    interactive: false,
++  },
++  image: {
++    typeName: "Image",
++    trait: "Image",
++    webRole: "img",
++    keywords: ["image", "img", "icon", "avatar", "logo", "illustration"],
++    interactive: false,
++  },
++  text: {
++    typeName: "Text",
++    trait: "Static Text",
++    webRole: "text",
++    keywords: [],
++    interactive: false,
++  },
++  group: {
++    typeName: "Group",
++    trait: "None",
++    webRole: "group",
++    keywords: [],
++    interactive: false,
++  },
++};
++
++/** Priority order used when scanning name keywords. */
++const ROLE_SCAN_ORDER: RoleKey[] = [
++  "switch",
++  "checkbox",
++  "radio",
++  "input",
++  "button",
++  "link",
++  "heading",
++  "image",
++];
++
++// ----------------------------------------------------------------------------
++// Hint packs (locale-specific copy — pulled out of logic)
++// ----------------------------------------------------------------------------
++
++type HintBuilder = (label: string) => { ios: string; android: string };
++type HintPack = Partial<Record<RoleKey, HintBuilder>>;
++
++const HINT_PACKS: Record<Locale, HintPack> = {
++  nb: {
++    button: (l) => ({
++      ios: l ? `Dobbelttrykk for å åpne ${l}` : "Dobbelttrykk for å åpne",
++      android: l
++        ? `Dobbelttrykk for å aktivere ${l}`
++        : "Dobbelttrykk for å aktivere",
++    }),
++    link: (l) => ({
++      ios: l ? `Dobbelttrykk for å åpne ${l}` : "Dobbelttrykk for å åpne lenke",
++      android: l
++        ? `Dobbelttrykk for å åpne ${l}`
++        : "Dobbelttrykk for å åpne lenke",
++    }),
++    input: (l) => ({
++      ios: l ? `Skriv inn ${l}` : "Skriv inn tekst",
++      android: l ? `Skriv inn ${l}` : "Skriv inn tekst",
++    }),
++    checkbox: () => ({
++      ios: "Dobbelttrykk for å velge eller fjerne valg",
++      android: "Dobbelttrykk for å velge eller fjerne valg",
++    }),
++    radio: () => ({
++      ios: "Dobbelttrykk for å velge dette alternativet",
++      android: "Dobbelttrykk for å velge dette alternativet",
++    }),
++    switch: () => ({
++      ios: "Dobbelttrykk for å slå av eller på",
++      android: "Dobbelttrykk for å slå av eller på",
++    }),
++  },
++  en: {
++    button: (l) => ({
++      ios: l ? `Double-tap to open ${l}` : "Double-tap to open",
++      android: l ? `Double-tap to activate ${l}` : "Double-tap to activate",
++    }),
++    link: (l) => ({
++      ios: l ? `Double-tap to open ${l}` : "Double-tap to open link",
++      android: l ? `Double-tap to open ${l}` : "Double-tap to open link",
++    }),
++    input: (l) => ({
++      ios: l ? `Enter ${l}` : "Enter text",
++      android: l ? `Enter ${l}` : "Enter text",
++    }),
++    checkbox: () => ({
++      ios: "Double-tap to select or deselect",
++      android: "Double-tap to select or deselect",
++    }),
++    radio: () => ({
++      ios: "Double-tap to select this option",
++      android: "Double-tap to select this option",
++    }),
++    switch: () => ({
++      ios: "Double-tap to toggle on or off",
++      android: "Double-tap to toggle on or off",
++    }),
++  },
++};
++
++// ----------------------------------------------------------------------------
++// Module-level locale (settable per project; defaults to today's behaviour)
++// ----------------------------------------------------------------------------
++
++let activeLocale: Locale = "nb";
++
++export function setGeneratorLocale(locale: Locale): void {
++  activeLocale = locale;
++}
++
++export function getGeneratorLocale(): Locale {
++  return activeLocale;
++}
++
++// ----------------------------------------------------------------------------
++// Small, defensive node readers (kept free of the `figma` global so they are
++// trivially unit-testable with plain object fixtures)
++// ----------------------------------------------------------------------------
++
++interface Box {
++  x: number;
++  y: number;
++  width: number;
++  height: number;
++}
++
++function getBox(node: SceneNode): Box {
++  const abs = (node as { absoluteBoundingBox?: Box | null })
++    .absoluteBoundingBox;
++  if (abs) return abs;
++  const x = "x" in node ? (node as { x: number }).x : 0;
++  const y = "y" in node ? (node as { y: number }).y : 0;
++  const width = "width" in node ? (node as { width: number }).width : 0;
++  const height = "height" in node ? (node as { height: number }).height : 0;
++  return { x, y, width, height };
++}
++
++function isContainer(
++  node: SceneNode
++): node is SceneNode & { findAll: FrameNode["findAll"]; children: readonly SceneNode[] } {
++  return "children" in node && "findAll" in node;
++}
++
++function hasVisibleImageFill(node: SceneNode): boolean {
++  const fills = (node as { fills?: readonly Paint[] | symbol }).fills;
++  if (!Array.isArray(fills)) return false;
++  return (fills as readonly Paint[]).some(
++    (f) => f.visible !== false && f.type === "IMAGE"
++  );
++}
++
++/** Layer names Figma auto-assigns carry no semantic signal. */
++function isJunkName(name: string): boolean {
++  return /^(frame|group|rectangle|ellipse|vector|polygon|star|line|component|instance|union|subtract|intersect|exclude|slice|mask)\s*\d*$/i.test(
++    name.trim()
++  );
++}
++
++/** Plugin scaffolding that must never be annotated. */
++function isScaffolding(node: SceneNode): boolean {
++  return (
++    isAnnotationTable(node) ||
++    node.name.startsWith("Annotation Container") ||
++    node.name.startsWith("Annotation Badge")
++  );
++}
++
++function matchRoleByKeyword(name: string): RoleKey | null {
++  const lower = name.toLowerCase();
++  for (const role of ROLE_SCAN_ORDER) {
++    if (ROLE_TABLE[role].keywords.some((kw) => lower.includes(kw))) {
++      return role;
++    }
++  }
++  return null;
++}
++
++/** Map a free-text trait (from a tag) onto a known role, best-effort. */
++function roleFromTraitWord(trait: string): RoleKey {
++  return matchRoleByKeyword(trait) ?? "text";
++}
++
++// ----------------------------------------------------------------------------
++// Classification — the heart of "understand the element"
++// ----------------------------------------------------------------------------
++
++export function classifyElement(node: SceneNode): ElementClassification {
++  // 1. Explicit tag (highest trust — the designer told us).
++  const tag = parseTaggedName(node.name);
++  if (tag) {
++    return {
++      role: roleFromTraitWord(tag.trait),
++      taggedLabel: tag.label,
++      taggedTrait: tag.trait,
++      source: "tag",
++    };
++  }
++
++  // 2. Plain text node → static text (unless its name says heading).
++  if (node.type === "TEXT") {
++    const byName = matchRoleByKeyword(node.name);
++    if (byName === "heading") return { role: "heading", source: "name" };
++    return { role: "text", source: "text" };
++  }
++
++  // 3. Component / instance name (a trusted signal in design-system files).
++  if (node.type === "COMPONENT" || node.type === "INSTANCE") {
++    const byComponent = matchRoleByKeyword(node.name);
++    if (byComponent) return { role: byComponent, source: "component" };
++  }
++
++  // 4. Generic layer-name keyword.
++  const byName = matchRoleByKeyword(node.name);
++  if (byName) return { role: byName, source: "name" };
++
++  // 5. Structural fallback for unstructured names ("Frame 12").
++  if (
++    node.type === "RECTANGLE" ||
++    node.type === "ELLIPSE" ||
++    node.type === "POLYGON" ||
++    node.type === "STAR" ||
++    node.type === "VECTOR"
++  ) {
++    return { role: "image", source: "structure" };
++  }
++  if (hasVisibleImageFill(node)) {
++    return { role: "image", source: "structure" };
++  }
++
++  return { role: "group", source: "structure" };
++}
++
++// ----------------------------------------------------------------------------
++// Label derivation — pick ONE meaningful label, never join every text node
++// ----------------------------------------------------------------------------
++
++function readChars(node: SceneNode): string {
++  return node.type === "TEXT" ? node.characters.trim() : "";
++}
++
++export function deriveLabel(node: SceneNode, classification?: ElementClassification): string {
++  const cls = classification ?? classifyElement(node);
++  if (cls.taggedLabel) return cls.taggedLabel;
++
++  if (node.type === "TEXT") {
++    const chars = readChars(node);
++    if (chars) return chars;
++  }
++
++  // First non-empty text descendant in reading order — not all of them joined.
++  if (isContainer(node)) {
++    const texts = node
++      .findAll((n) => n.type === "TEXT")
++      .filter((n) => n.visible !== false);
++    const ordered = [...texts].sort(readingOrderComparator);
++    for (const t of ordered) {
++      const chars = readChars(t);
++      if (chars) return chars;
++    }
++  }
++
++  // Fall back to the layer name, unless it is auto-generated junk.
++  return isJunkName(node.name) ? "" : node.name;
++}
++
++// ----------------------------------------------------------------------------
++// Field assembly
++// ----------------------------------------------------------------------------
++
++export function buildFields(
++  node: SceneNode,
++  options: GenerateOptions = {}
++): GeneratedFields {
++  const locale = options.locale ?? activeLocale;
++  const cls = classifyElement(node);
++  const def = ROLE_TABLE[cls.role];
++
++  const label = deriveLabel(node, cls) || node.name || "Unnamed Element";
++  const trait = cls.taggedTrait ?? def.trait;
++  const isTextual = cls.role === "text" || cls.role === "heading";
++  const value = isTextual ? label : "n/a";
++
++  let hintIOS = "";
++  let hintAndroid = "";
++  if (def.interactive) {
++    const hintLabel = isTextual ? "" : deriveLabel(node, cls);
++    const builder = HINT_PACKS[locale][cls.role];
++    if (builder) {
++      const built = builder(hintLabel);
++      hintIOS = built.ios;
++      hintAndroid = built.android;
++    }
++  }
++
++  return {
++    elementType: def.typeName,
++    label,
++    value,
++    trait,
++    role: def.webRole,
++    hintIOS,
++    hintAndroid,
++    voicedPreview: `"${label}. ${def.typeName}."`,
++  };
++}
++
++// ----------------------------------------------------------------------------
++// Reading order
++// ----------------------------------------------------------------------------
++
++/** Rows within this many pixels vertically are treated as the same line. */
++const ROW_TOLERANCE = 8;
++
++export function readingOrderComparator(a: SceneNode, b: SceneNode): number {
++  const ba = getBox(a);
++  const bb = getBox(b);
++  if (Math.abs(ba.y - bb.y) <= ROW_TOLERANCE) {
++    return ba.x - bb.x; // same row → left-to-right
++  }
++  return ba.y - bb.y; // otherwise top-to-bottom
++}
++
++// ----------------------------------------------------------------------------
++// Frame walk — collect the elements that each deserve an annotation
++// ----------------------------------------------------------------------------
++
++/**
++ * Walk a frame and return the focusable elements in reading order.
++ *
++ * A node becomes its own annotation when it is a concrete control or piece of
++ * content (button, text, image, …). Purely structural containers are skipped
++ * and we recurse into them instead — so a card frame yields its inner button
++ * and label, not the card wrapper. Tagged elements are always included.
++ */
++export function collectFocusableElements(
++  frame: FrameNode | SectionNode
++): SceneNode[] {
++  const collected: SceneNode[] = [];
++
++  const visit = (node: SceneNode): void => {
++    if (node.visible === false || isScaffolding(node)) return;
++
++    const tagged = parseTaggedName(node.name) !== null;
++    const cls = classifyElement(node);
++    const isConcrete = cls.role !== "group";
++
++    if (tagged || isConcrete) {
++      // Treat as a single unit — don't descend into its internals.
++      collected.push(node);
++      return;
++    }
++
++    // Structural container → recurse.
++    if (isContainer(node)) {
++      for (const child of node.children) visit(child);
++    }
++  };
++
++  for (const child of frame.children) visit(child);
++
++  collected.sort(readingOrderComparator);
++  return collected;
++}
+diff --git a/src/utils/annotation-helpers.ts b/src/utils/annotation-helpers.ts
+index 11c835a..fcf462b 100644
+--- a/src/utils/annotation-helpers.ts
++++ b/src/utils/annotation-helpers.ts
+@@ -1,11 +1,89 @@
+ // ============================================================================
+ // ANNOTATION HELPERS - Annotation-specific utility functions
+ // ============================================================================
++// Thin compatibility layer over the data-driven annotation generator.
++// The classification/label/hint logic now lives in ./annotation-generator;
++// this module preserves the historical `extractElementMetadata` shape and
++// adds the frame-level generation entry point.
++// ============================================================================
++
++import type { Annotation } from "../types";
++import {
++  buildFields,
++  collectFocusableElements,
++  type GenerateOptions,
++} from "./annotation-generator";
++
++export interface FrameInfo {
++  id: string;
++  name: string;
++  pageId: string;
++  pageName: string;
++}
++
++/**
++ * Assemble a complete Annotation from a node, deriving all accessibility
++ * fields via the generator. Shared by the single-select create flow and the
++ * frame-level auto-generate flow so field shape stays identical.
++ */
++export function assembleAnnotation(
++  node: SceneNode,
++  id: number,
++  platform: "mobile" | "web",
++  frame: FrameInfo,
++  options: GenerateOptions = {}
++): Annotation {
++  const f = buildFields(node, options);
++  const now = Date.now();
++  return {
++    id,
++    frameId: frame.id,
++    frameName: frame.name,
++    pageId: frame.pageId,
++    pageName: frame.pageName,
++    platform,
++    elementId: node.id,
++    elementName: node.name || "Unnamed Element",
++    voicedPreview: f.voicedPreview,
++    targetElementId: node.id,
++    createdAt: now,
++    updatedAt: now,
++    mobile: {
++      ios: { label: f.label, value: f.value, trait: f.trait, hint: f.hintIOS },
++      android: {
++        label: `${f.label} (contentDescription)`,
++        value: f.value,
++        trait: f.trait,
++        hint: f.hintAndroid,
++      },
++    },
++    web: {
++      ariaLabel: f.label,
++      role: f.role,
++      ariaDescribedBy: "n/a",
++      tabIndex: id.toString(),
++    },
++  };
++}
++
++export {
++  classifyElement,
++  collectFocusableElements,
++  deriveLabel,
++  setGeneratorLocale,
++  getGeneratorLocale,
++  type Locale,
++  type RoleKey,
++} from "./annotation-generator";
+ 
+ /**
+- * Extract element metadata and generate intelligent defaults for annotations
++ * Extract element metadata and generate intelligent defaults for a single
++ * element. Kept for backward compatibility with the single-select create flow.
+  */
+-export function extractElementMetadata(element: SceneNode): {
++export function extractElementMetadata(
++  element: SceneNode,
++  options: GenerateOptions = {}
++): {
+   elementType: string;
+   textContent: string;
+   voicedPreview: string;
+@@ -14,161 +92,31 @@ export function extractElementMetadata(element: SceneNode): {
+   suggestedHintIOS: string;
+   suggestedHintAndroid: string;
+ } {
+-  let elementTypeName = ""; // Human-readable element type name
+-  let textContent = "";
+-  let suggestedRole = "";
+-  let suggestedTrait = "";
+-  let suggestedHintIOS = ""; // iOS-specific hint
+-  let suggestedHintAndroid = ""; // Android-specific hint
+-
+-  // Extract text content from the element
+-  if (element.type === "TEXT") {
+-    textContent = (element).characters;
+-    elementTypeName = "Text";
+-    suggestedRole = "text";
+-    suggestedTrait = "Static Text";
+-    suggestedHintIOS = "";
+-    suggestedHintAndroid = "";
+-  } else if (
+-    element.type === "FRAME" ||
+-    element.type === "COMPONENT" ||
+-    element.type === "INSTANCE"
+-  ) {
+-    // Check if frame/component contains text
+-    const textNodes = element.findAll((n) => n.type === "TEXT") as TextNode[];
+-    if (textNodes.length > 0) {
+-      textContent = textNodes.map((t) => t.characters).join(" ");
+-    }
+-
+-    // Infer element type from name
+-    const nameLower = element.name.toLowerCase();
+-    if (nameLower.includes("button") || nameLower.includes("btn")) {
+-      elementTypeName = "Button";
+-      suggestedRole = "button";
+-      suggestedTrait = "Button";
+-      // iOS uses "open", Android uses "activate"
+-      suggestedHintIOS = textContent
+-        ? `Dobbelttrykk for å åpne ${textContent}`
+-        : "Dobbelttrykk for å åpne";
+-      suggestedHintAndroid = textContent
+-        ? `Dobbelttrykk for å aktivere ${textContent}`
+-        : "Dobbelttrykk for å aktivere";
+-    } else if (
+-      nameLower.includes("input") ||
+-      nameLower.includes("field") ||
+-      nameLower.includes("textbox")
+-    ) {
+-      elementTypeName = "Input Field";
+-      suggestedRole = "textbox";
+-      suggestedTrait = "Text Field";
+-      suggestedHintIOS = textContent
+-        ? `Skriv inn ${textContent}`
+-        : "Skriv inn tekst";
+-      suggestedHintAndroid = textContent
+-        ? `Skriv inn ${textContent}`
+-        : "Skriv inn tekst";
+-    } else if (nameLower.includes("checkbox") || nameLower.includes("check")) {
+-      elementTypeName = "Checkbox";
+-      suggestedRole = "checkbox";
+-      suggestedTrait = "Button";
+-      suggestedHintIOS = "Dobbelttrykk for å velge eller fjerne valg";
+-      suggestedHintAndroid = "Dobbelttrykk for å velge eller fjerne valg";
+-    } else if (nameLower.includes("radio")) {
+-      elementTypeName = "Radio Button";
+-      suggestedRole = "radio";
+-      suggestedTrait = "Button";
+-      suggestedHintIOS = "Dobbelttrykk for å velge dette alternativet";
+-      suggestedHintAndroid = "Dobbelttrykk for å velge dette alternativet";
+-    } else if (nameLower.includes("switch") || nameLower.includes("toggle")) {
+-      elementTypeName = "Switch";
+-      suggestedRole = "switch";
+-      suggestedTrait = "Button";
+-      suggestedHintIOS = "Dobbelttrykk for å slå av eller på";
+-      suggestedHintAndroid = "Dobbelttrykk for å slå av eller på";
+-    } else if (
+-      nameLower.includes("image") ||
+-      nameLower.includes("img") ||
+-      nameLower.includes("icon")
+-    ) {
+-      elementTypeName = "Image";
+-      suggestedRole = "image";
+-      suggestedTrait = "Image";
+-      suggestedHintIOS = "";
+-      suggestedHintAndroid = "";
+-    } else if (nameLower.includes("link")) {
+-      elementTypeName = "Link";
+-      suggestedRole = "link";
+-      suggestedTrait = "Link";
+-      suggestedHintIOS = textContent
+-        ? `Dobbelttrykk for å åpne ${textContent}`
+-        : "Dobbelttrykk for å åpne lenke";
+-      suggestedHintAndroid = textContent
+-        ? `Dobbelttrykk for å åpne ${textContent}`
+-        : "Dobbelttrykk for å åpne lenke";
+-    } else if (
+-      nameLower.includes("header") ||
+-      nameLower.includes("heading") ||
+-      nameLower.includes("title")
+-    ) {
+-      elementTypeName = "Heading";
+-      suggestedRole = "heading";
+-      suggestedTrait = "Header";
+-      suggestedHintIOS = "";
+-      suggestedHintAndroid = "";
+-    } else {
+-      elementTypeName = "Frame";
+-      suggestedRole = "group";
+-      suggestedTrait = "None";
+-      suggestedHintIOS = "";
+-      suggestedHintAndroid = "";
+-    }
+-  } else if (
+-    element.type === "RECTANGLE" ||
+-    element.type === "ELLIPSE" ||
+-    element.type === "POLYGON" ||
+-    element.type === "STAR" ||
+-    element.type === "VECTOR"
+-  ) {
+-    elementTypeName = "Shape";
+-    suggestedRole = "img";
+-    suggestedTrait = "Image";
+-    suggestedHintIOS = "";
+-    suggestedHintAndroid = "";
+-  } else if (element.type === "GROUP") {
+-    const textNodes = element.findAll((n) => n.type === "TEXT") as TextNode[];
+-    if (textNodes.length > 0) {
+-      textContent = textNodes.map((t) => t.characters).join(" ");
+-    }
+-    elementTypeName = "Group";
+-    suggestedRole = "group";
+-    suggestedTrait = "None";
+-    suggestedHintIOS = "";
+-    suggestedHintAndroid = "";
+-  } else {
+-    // Fallback for any other node types
+-    elementTypeName = element.type;
+-    suggestedRole = "group";
+-    suggestedTrait = "None";
+-    suggestedHintIOS = "";
+-    suggestedHintAndroid = "";
+-  }
+-
+-  // Generate voiced preview based on extracted data
+-  let voicedPreview = "";
+-  if (textContent) {
+-    voicedPreview = `"${textContent}. ${elementTypeName}."`;
+-  } else {
+-    voicedPreview = `"${element.name}. ${elementTypeName}."`;
+-  }
+-
++  const fields = buildFields(element, options);
+   return {
+-    elementType: elementTypeName,
+-    textContent,
+-    voicedPreview,
+-    suggestedRole,
+-    suggestedTrait,
+-    suggestedHintIOS,
+-    suggestedHintAndroid,
++    elementType: fields.elementType,
++    // `textContent` historically meant "the label-ish text"; map to label.
++    textContent: fields.value === "n/a" ? "" : fields.label,
++    voicedPreview: fields.voicedPreview,
++    suggestedRole: fields.role,
++    suggestedTrait: fields.trait,
++    suggestedHintIOS: fields.hintIOS,
++    suggestedHintAndroid: fields.hintAndroid,
+   };
+ }
+ 
++/**
++ * Generate annotation field drafts for every focusable element in a frame,
++ * in reading order. Each entry pairs the source node with its derived fields;
++ * the caller assembles full Annotation objects (assigning IDs, timestamps and
++ * the mobile/web split).
++ */
++export function generateFrameFieldDrafts(
++  frame: FrameNode | SectionNode,
++  options: GenerateOptions = {}
++): Array<{ node: SceneNode; fields: ReturnType<typeof buildFields> }> {
++  return collectFocusableElements(frame).map((node) => ({
++    node,
++    fields: buildFields(node, options),
++  }));
++}
+-- 
+2.43.0
+
