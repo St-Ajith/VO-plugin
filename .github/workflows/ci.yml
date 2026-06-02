@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+    
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check:
+    name: Check changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      run_tests: ${{ steps.set_run_tests.outputs.run_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Filter changed files
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - 'README.md'
+              - 'PRD.md'
+              - 'PLUGIN_SUMMARY.md'
+              - 'openspec/**'
+              - 'codepractices/**'
+              - 'docs/**'
+              - '**/*.md'
+            code:
+              - 'src/**'
+              - 'hooks/**'
+              - 'ui/**'
+              - 'services/**'
+              - 'schema/**'
+              - 'utils/**'
+              - 'build/**'
+              - '__tests__/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'pnpm-lock.yaml'
+              - 'yarn.lock'
+              - 'tsconfig.json'
+              - 'vitest.config.ts'
+              - 'eslint.config.mjs'
+              - '.github/**'
+              - '**/*.ts'
+              - '**/*.tsx'
+              - '**/*.js'
+              - '**/*.jsx'
+
+      - name: Set job run_tests output
+        id: set_run_tests
+        run: |
+          echo "run_tests=${{ steps.filter.outputs.code }}" >> $GITHUB_OUTPUT
+
+  test:
+    name: Lint, Build & Test
+    needs: check
+    if: needs.check.outputs.run_tests == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          check-latest: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run tests with coverage
+        run: npm run test:coverage

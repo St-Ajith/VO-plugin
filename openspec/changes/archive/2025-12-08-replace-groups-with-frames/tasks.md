@@ -1,0 +1,26 @@
+# Tasks
+
+- [x] Define Spec Delta for Badge Frames <!-- id: 0 -->
+  - [x] Update `specs/canvas-rendering/spec.md` with new requirements <!-- id: 1 -->
+- [x] Refactor `canvas-badge.ts` <!-- id: 2 -->
+  - [x] Replace `figma.group` with `figma.createFrame` <!-- id: 3 -->
+  - [x] Set transparent fill/stroke for FrameGroup behavior <!-- id: 4 -->
+  - [x] Update return types to `FrameNode` <!-- id: 5 -->
+  - [x] Store `elementId` in badge metadata <!-- id: 18 -->
+  - [x] Update metadata in `updateBadge` for self-healing <!-- id: 19 -->
+- [x] Refactor `canvas-parser.ts` <!-- id: 6 -->
+  - [x] Update `isBadge` to check for `FRAME` type <!-- id: 7 -->
+  - [x] Maintain `GROUP` check for legacy support <!-- id: 8 -->
+  - [x] Add `resolveElementId` Strategy 3a: Read Badge Metadata <!-- id: 20 -->
+  - [x] Update `findElementFromBadge` for container traversal <!-- id: 21 -->
+- [x] Refactor Type Defs <!-- id: 9 -->
+  - [x] Update `transaction-wrapper.ts` <!-- id: 10 -->
+  - [x] Add `elementId` to `BadgeMetadata` in `types.ts` <!-- id: 22 -->
+- [x] Update Tests <!-- id: 12 -->
+  - [x] Update `MockGroupNode` usages to `MockFrameNode` <!-- id: 13 -->
+  - [x] Fix integration tests <!-- id: 14 -->
+- [x] Verify <!-- id: 15 -->
+  - [x] Verify badge creation creates a Frame <!-- id: 16 -->
+  - [x] Verify badge layout is correct <!-- id: 17 -->
+  - [x] Verify parser resolves element ID correctly <!-- id: 23 -->
+  - [x] Run full test suite (381 tests passed) <!-- id: 24 -->

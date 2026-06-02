@@ -1,0 +1,75 @@
+{
+  "name": "vo-annotations",
+  "packageManager": "npm@11.7.0",
+  "dependencies": {
+    "@create-figma-plugin/ui": "^4.0.3",
+    "@create-figma-plugin/utilities": "^4.0.3",
+    "@preact/signals": "^2.5.1",
+    "@types/node": "^25.0.3",
+    "preact": ">=10",
+    "valibot": "^1.2.0"
+  },
+  "devDependencies": {
+    "@create-figma-plugin/build": "^4.0.3",
+    "@create-figma-plugin/tsconfig": "^4.0.3",
+    "@eslint/js": "^9.39.2",
+    "@figma/eslint-plugin-figma-plugins": ">=1.0.0",
+    "@figma/plugin-typings": ">=1.121.0",
+    "@vitest/coverage-v8": "^4.0.16",
+    "@vitest/eslint-plugin": "^1.6.5",
+    "eslint": ">=9.39.2",
+    "eslint-config-prettier": "^10.1.8",
+    "typescript": ">=5",
+    "typescript-eslint": ">=8.48.1s",
+    "vitest": "^4.0.16"
+  },
+  "overrides": {
+    "@typescript-eslint/utils": ">=8.48.1"
+  },
+  "scripts": {
+    "build": "build-figma-plugin --typecheck --minify",
+    "build:debug": "build-figma-plugin --typecheck",
+    "debug-server": "node debug-server.js",
+    "watch": "build-figma-plugin --typecheck --watch",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "docs:validate": "node scripts/validate-docs.js",
+    "docs:check-links": "node scripts/check-doc-links.js",
+    "docs:update-counts": "node scripts/update-line-counts.js"
+  },
+  "figma-plugin": {
+    "editorType": [
+      "figma"
+    ],
+    "id": "voice-over-annotations",
+    "name": "VO Annotations",
+    "main": "src/main.ts",
+    "ui": "src/ui.tsx",
+    "documentAccess": "dynamic-page",
+    "networkAccess": {
+      "allowedDomains": [
+        "none"
+      ],
+      "reasoning": "Debug port configuration",
+      "devAllowedDomains": [
+        "http://localhost:9223"
+      ]
+    },
+    "api": "1.0.0",
+    "relaunchButtons": {
+      "insertAnnotations": {
+        "name": "Insert Annotations",
+        "main": "src/main.ts",
+        "ui": "src/ui.tsx"
+      },
+      "syncCanvas": {
+        "name": "Sync Canvas",
+        "main": "src/main.ts",
+        "ui": "src/ui.tsx"
+      }
+    }
+  }
+}

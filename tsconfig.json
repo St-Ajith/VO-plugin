@@ -1,0 +1,50 @@
+{
+  "compilerOptions": {
+    // JSX Configuration for Preact
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+
+    // Module Configuration
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+
+    // Strict Type Checking
+    "strict": true,
+    // Note: noUncheckedIndexedAccess and exactOptionalPropertyTypes are stricter
+    // but require significant code changes
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+
+    // Interop
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": false,
+
+    // Type Resolution - Include Figma types automatically
+    "typeRoots": [
+      "./node_modules/@figma",
+      "./node_modules/@types"
+    ],
+    // Note: Omitting "types" array means all types from typeRoots are included
+
+    // Build Options
+    "noEmit": true,
+    "skipLibCheck": true,
+
+    // Path Aliases for Preact/React compatibility
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "react": ["./node_modules/preact/compat/"],
+      "react/jsx-runtime": ["./node_modules/preact/jsx-runtime"],
+      "react-dom": ["./node_modules/preact/compat/"],
+      "react-dom/*": ["./node_modules/preact/compat/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["node_modules", "build", "coverage"]
+}

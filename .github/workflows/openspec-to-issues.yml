@@ -1,0 +1,224 @@
+name: OpenSpec to GitHub Issues
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'openspec/changes/**/proposal.md'
+      - 'openspec/changes/**/tasks.md'
+  workflow_dispatch:
+    inputs:
+      change_id:
+        description: 'Specific change ID to sync (leave empty for all)'
+        required: false
+        type: string
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  sync-specs-to-issues:
+    name: Sync OpenSpec Changes to Issues
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Create issues from OpenSpec changes
+        uses: actions/github-script@v8
+        env:
+          SPECIFIC_CHANGE: ${{ inputs.change_id || '' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const changesDir = 'openspec/changes';
+            const specificChange = process.env.SPECIFIC_CHANGE;
+
+            // Get all change directories (excluding archive)
+            const changeDirs = fs.readdirSync(changesDir)
+              .filter(dir => {
+                const fullPath = path.join(changesDir, dir);
+                return fs.statSync(fullPath).isDirectory() && dir !== 'archive';
+              })
+              .filter(dir => !specificChange || dir === specificChange);
+
+            console.log(`Found ${changeDirs.length} change(s) to process`);
+
+            for (const changeId of changeDirs) {
+              const changeDir = path.join(changesDir, changeId);
+              const proposalPath = path.join(changeDir, 'proposal.md');
+              const tasksPath = path.join(changeDir, 'tasks.md');
+
+              if (!fs.existsSync(proposalPath)) {
+                console.log(`Skipping ${changeId}: no proposal.md found`);
+                continue;
+              }
+
+              const proposal = fs.readFileSync(proposalPath, 'utf8');
+              const tasks = fs.existsSync(tasksPath) 
+                ? fs.readFileSync(tasksPath, 'utf8') 
+                : '';
+
+              // Calculate task completion status
+              const totalTasks = (tasks.match(/- \[[ x]\]/g) || []).length;
+              const completedTasks = (tasks.match(/- \[x\]/g) || []).length;
+              const allTasksComplete = totalTasks > 0 && completedTasks === totalTasks;
+              const completionPercent = totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0;
+
+              // Extract title from proposal (first # heading)
+              const titleMatch = proposal.match(/^#\s+(?:Change:\s*)?(.+)$/m);
+              const title = titleMatch 
+                ? `[OpenSpec] ${titleMatch[1].trim()}`
+                : `[OpenSpec] ${changeId}`;
+
+              // Read the apply prompt for agent instructions
+              const applyPromptPath = '.github/prompts/openspec-apply.prompt.md';
+              const applyPrompt = fs.existsSync(applyPromptPath)
+                ? fs.readFileSync(applyPromptPath, 'utf8')
+                : '';
+
+              // Extract just the instructions from the prompt (between OPENSPEC markers)
+              const promptMatch = applyPrompt.match(/<!-- OPENSPEC:START -->([\s\S]*?)<!-- OPENSPEC:END -->/);
+              const agentInstructions = promptMatch 
+                ? promptMatch[1].trim()
+                : `1. Read \`openspec/changes/${changeId}/proposal.md\` and \`design.md\` (if present)
+            2. Follow tasks in \`openspec/changes/${changeId}/tasks.md\`
+            3. Run \`openspec validate ${changeId} --strict\` before completing`;
+
+              // Read the archive prompt for post-completion instructions
+              const archivePromptPath = '.github/prompts/openspec-archive.prompt.md';
+              const archivePrompt = fs.existsSync(archivePromptPath)
+                ? fs.readFileSync(archivePromptPath, 'utf8')
+                : '';
+              const archiveMatch = archivePrompt.match(/<!-- OPENSPEC:START -->([\s\S]*?)<!-- OPENSPEC:END -->/);
+              const archiveInstructions = archiveMatch ? archiveMatch[1].trim() : '';
+
+              // Build status badge
+              const statusBadge = allTasksComplete 
+                ? '✅ **Ready to Archive** - All tasks complete!'
+                : `📊 **Progress:** ${completedTasks}/${totalTasks} tasks (${completionPercent}%)`;
+
+              // Build archive section (only shown when all tasks complete)
+              const archiveSection = allTasksComplete ? `
+            ---
+
+            <details>
+            <summary>🏁 Ready to Archive - All Tasks Complete!</summary>
+
+            All ${totalTasks} tasks have been marked complete. If implementation is verified and merged, archive this change:
+
+            ${archiveInstructions || `\`\`\`bash
+            openspec archive ${changeId} --yes
+            openspec validate --strict
+            \`\`\``}
+
+            **After archiving:**
+            1. Close this issue
+            2. Verify specs are updated in \`openspec/specs/\`
+            3. Change moves to \`openspec/changes/archive/\`
+
+            </details>
+            ` : '';
+
+              // Build issue body
+              const body = `## Overview
+
+            ${statusBadge}
+
+            This issue tracks the implementation of OpenSpec change: \`${changeId}\`
+
+            ---
+
+            ${proposal}
+
+            ---
+
+            ## Tasks
+
+            ${tasks || '_No tasks defined yet._'}
+
+            ---
+
+            <details>
+            <summary>🤖 Copilot Agent Instructions</summary>
+
+            ### How to implement this change
+
+            Replace \`<id>\` with \`${changeId}\` in the instructions below:
+
+            ${agentInstructions}
+
+            ### Quick Reference
+
+            \`\`\`bash
+            # Validate the change
+            openspec validate ${changeId} --strict
+
+            # Show change details
+            openspec show ${changeId}
+
+            # List all specs
+            openspec list --specs
+            \`\`\`
+
+            </details>
+            ${archiveSection}
+            ---
+            _Auto-generated from OpenSpec. Source: \`openspec/changes/${changeId}/\`_
+            `;
+
+              // Check if issue already exists
+              const existingIssues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'all',
+                labels: 'openspec',
+                per_page: 100
+              });
+
+              const existingIssue = existingIssues.data.find(issue => 
+                issue.title.includes(changeId) || 
+                issue.body?.includes(`\`${changeId}\``)
+              );
+
+              if (existingIssue) {
+                console.log(`Issue already exists for ${changeId}: #${existingIssue.number}`);
+                
+                // Update existing issue if not closed
+                if (existingIssue.state === 'open') {
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: existingIssue.number,
+                    body: body
+                  });
+                  console.log(`Updated issue #${existingIssue.number}`);
+                }
+                continue;
+              }
+
+              // Determine labels based on change ID
+              const labels = ['openspec'];
+              if (changeId.startsWith('add-')) labels.push('enhancement');
+              if (changeId.startsWith('fix-')) labels.push('bug');
+              if (changeId.startsWith('refactor-')) labels.push('refactor');
+              if (changeId.includes('performance')) labels.push('performance');
+              if (changeId.includes('investigate')) labels.push('investigation');
+
+              // Create new issue
+              const newIssue = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: labels
+              });
+
+              console.log(`Created issue #${newIssue.data.number}: ${title}`);
+            }
+
+            console.log('Done!');

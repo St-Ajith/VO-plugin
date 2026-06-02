@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach to Figma (VO Annotations)",
+      "type": "chrome",
+      "request": "attach",
+      "port": 9222,
+      "webRoot": "${workspaceFolder}",
+      "sourceMapPathOverrides": {
+        "webpack:///../src/*": "${webRoot}/src/*",
+        "webpack:///node_modules/*": "${webRoot}/node_modules/*",
+        "webpack:///*": "${webRoot}/*"
+      }
+    }
+  ]
+}

@@ -1,0 +1,304 @@
+name: OpenSpec Agent Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        type: choice
+        options:
+          - single        # Run one specific change
+          - batch         # Run multiple changes in priority order
+          - continue      # Continue from where we left off (skip completed)
+        default: batch
+      change_id:
+        description: 'Change ID (required for single mode, optional filter for batch)'
+        required: false
+        type: string
+      max_changes:
+        description: 'Max changes to process in batch mode (0 = all pending)'
+        required: false
+        type: number
+        default: 0
+      auto_archive:
+        description: 'Automatically archive completed changes'
+        required: false
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Dry run (preview only, no agent triggers)'
+        required: false
+        type: boolean
+        default: false
+ # schedule:
+    # Disabled by default - uncomment to enable overnight runs
+    # - cron: '0 2 * * *'  # 2 AM UTC
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+env:
+  # Priority order - lower = higher priority (implement first)
+  # Edit this to change implementation order
+  PRIORITY_ORDER: |
+    gauge-performance-benchmarks=1
+    add-intelligent-badge-placement=2
+    investigate-collision-avoidance=3
+    add-leader-line-connectors=4
+    add-dev-mode-sync=5
+
+jobs:
+  run-agents:
+    name: Run OpenSpec Agents
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          check-latest: true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Analyze changes
+        id: analyze
+        uses: actions/github-script@v8
+        env:
+          MODE: ${{ inputs.mode || 'batch' }}
+          CHANGE_ID: ${{ inputs.change_id || '' }}
+          MAX_CHANGES: ${{ inputs.max_changes || '0' }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const changesDir = 'openspec/changes';
+            const mode = process.env.MODE;
+            const specificChange = process.env.CHANGE_ID;
+            const maxChanges = parseInt(process.env.MAX_CHANGES) || 999;
+
+            // Parse priority order from env
+            const priorityOrder = {};
+            process.env.PRIORITY_ORDER.trim().split('\n').forEach(line => {
+              const [id, priority] = line.split('=');
+              if (id && priority) priorityOrder[id.trim()] = parseInt(priority);
+            });
+
+            // Get all pending changes
+            const changeDirs = fs.readdirSync(changesDir)
+              .filter(dir => {
+                const fullPath = path.join(changesDir, dir);
+                return fs.statSync(fullPath).isDirectory() && dir !== 'archive';
+              });
+
+            // Calculate status for each change
+            const changes = changeDirs.map(changeId => {
+              const tasksPath = path.join(changesDir, changeId, 'tasks.md');
+              let totalTasks = 0, completedTasks = 0;
+              
+              if (fs.existsSync(tasksPath)) {
+                const tasks = fs.readFileSync(tasksPath, 'utf8');
+                totalTasks = (tasks.match(/- \[[ x]\]/g) || []).length;
+                completedTasks = (tasks.match(/- \[x\]/g) || []).length;
+              }
+
+              return {
+                id: changeId,
+                priority: priorityOrder[changeId] || 99,
+                totalTasks,
+                completedTasks,
+                isComplete: totalTasks > 0 && completedTasks === totalTasks,
+                percent: totalTasks > 0 ? Math.round((completedTasks / totalTasks) * 100) : 0
+              };
+            });
+
+            // Sort by priority
+            changes.sort((a, b) => a.priority - b.priority);
+
+            // Determine which changes to process based on mode
+            let toProcess = [];
+            let toArchive = changes.filter(c => c.isComplete);
+
+            if (mode === 'single') {
+              if (!specificChange) {
+                core.setFailed('Change ID is required for single mode');
+                return;
+              }
+              const found = changes.find(c => c.id === specificChange);
+              if (!found) {
+                core.setFailed(`Change not found: ${specificChange}`);
+                return;
+              }
+              if (found.isComplete) {
+                console.log(`Change ${specificChange} is already complete`);
+                toProcess = [];
+              } else {
+                toProcess = [found];
+              }
+            } else if (mode === 'continue') {
+              // Skip completed, process incomplete in order
+              toProcess = changes.filter(c => !c.isComplete).slice(0, maxChanges);
+            } else {
+              // batch mode - optionally filter by change_id prefix
+              let filtered = changes.filter(c => !c.isComplete);
+              if (specificChange) {
+                filtered = filtered.filter(c => c.id.includes(specificChange));
+              }
+              toProcess = filtered.slice(0, maxChanges);
+            }
+
+            console.log('=== Analysis ===');
+            console.log(`Mode: ${mode}`);
+            console.log(`\nAll changes:`);
+            changes.forEach(c => {
+              const status = c.isComplete ? '✅' : '⏳';
+              console.log(`  ${status} [${c.priority}] ${c.id} (${c.completedTasks}/${c.totalTasks})`);
+            });
+            console.log(`\nWill process: ${toProcess.length} change(s)`);
+            toProcess.forEach(c => console.log(`  → ${c.id}`));
+            console.log(`\nReady to archive: ${toArchive.length} change(s)`);
+            toArchive.forEach(c => console.log(`  → ${c.id}`));
+
+            core.setOutput('to_process', JSON.stringify(toProcess));
+            core.setOutput('to_archive', JSON.stringify(toArchive));
+            core.setOutput('process_count', toProcess.length);
+            core.setOutput('archive_count', toArchive.length);
+
+      - name: Trigger agents
+        if: ${{ inputs.dry_run != true && steps.analyze.outputs.process_count > 0 }}
+        uses: actions/github-script@v8
+        env:
+          TO_PROCESS: ${{ steps.analyze.outputs.to_process }}
+        with:
+          script: |
+            const fs = require('fs');
+            const toProcess = JSON.parse(process.env.TO_PROCESS);
+
+            console.log(`\n🤖 Triggering Copilot on ${toProcess.length} issue(s)...\n`);
+
+            for (const change of toProcess) {
+              // Find the issue for this change
+              const issues = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: 'openspec',
+                per_page: 100
+              });
+
+              const issue = issues.data.find(i => 
+                i.title.includes(change.id) || 
+                i.body?.includes(`\`${change.id}\``)
+              );
+
+              if (!issue) {
+                console.log(`⚠️  No issue found for ${change.id} - run 'OpenSpec to GitHub Issues' first`);
+                continue;
+              }
+
+              // Read apply prompt
+              const applyPromptPath = '.github/prompts/openspec-apply.prompt.md';
+              let agentInstructions = '';
+              if (fs.existsSync(applyPromptPath)) {
+                const prompt = fs.readFileSync(applyPromptPath, 'utf8');
+                const match = prompt.match(/<!-- OPENSPEC:START -->([\s\S]*?)<!-- OPENSPEC:END -->/);
+                if (match) agentInstructions = match[1].trim();
+              }
+
+              const comment = `## 🤖 Agent Implementation Request
+
+            **Change:** \`${change.id}\`
+            **Progress:** ${change.completedTasks}/${change.totalTasks} tasks (${change.percent}%)
+            **Priority:** ${change.priority}
+
+            ---
+
+            ${agentInstructions || `**Steps:**
+            1. Read \`openspec/changes/${change.id}/proposal.md\`
+            2. Read \`openspec/changes/${change.id}/design.md\` (if exists)
+            3. Follow tasks in \`openspec/changes/${change.id}/tasks.md\`
+            4. Run \`openspec validate ${change.id} --strict\` when done`}
+            `;
+
+              // Assign Copilot to the issue
+              try {
+                await github.rest.issues.addAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  assignees: ['copilot']
+                });
+                console.log(`  Assigned @copilot to #${issue.number}`);
+              } catch (err) {
+                console.log(`  ⚠️ Could not assign Copilot: ${err.message}`);
+                console.log(`  (Copilot may not be enabled for this repo)`);
+              }
+
+              // Add comment with instructions
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: comment
+              });
+
+              console.log(`✅ Triggered #${issue.number}: ${change.id}`);
+
+              // Rate limit protection
+              await new Promise(r => setTimeout(r, 2000));
+            }
+
+      - name: Archive completed
+        if: ${{ inputs.dry_run != true && inputs.auto_archive == true && steps.analyze.outputs.archive_count > 0 }}
+        run: |
+          echo "📦 Archiving completed changes..."
+          echo '${{ steps.analyze.outputs.to_archive }}' | jq -r '.[].id' | while read id; do
+            echo "  Archiving: $id"
+            # npx openspec archive "$id" --yes
+            echo "  (Uncomment above line to enable auto-archive)"
+          done
+
+      - name: Summary
+        uses: actions/github-script@v8
+        env:
+          TO_PROCESS: ${{ steps.analyze.outputs.to_process }}
+          TO_ARCHIVE: ${{ steps.analyze.outputs.to_archive }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          MODE: ${{ inputs.mode || 'batch' }}
+        with:
+          script: |
+            const toProcess = JSON.parse(process.env.TO_PROCESS);
+            const toArchive = JSON.parse(process.env.TO_ARCHIVE);
+            const dryRun = process.env.DRY_RUN === 'true';
+            const mode = process.env.MODE;
+
+            const summary = `## 🤖 OpenSpec Agent Runner
+
+            ${dryRun ? '> ⚠️ **DRY RUN** - No agents were triggered\n\n' : ''}
+
+            **Mode:** ${mode}
+
+            ### Processed (${toProcess.length})
+            | Priority | Change | Progress | Status |
+            |----------|--------|----------|--------|
+            ${toProcess.length > 0 
+              ? toProcess.map(c => `| ${c.priority} | \`${c.id}\` | ${c.completedTasks}/${c.totalTasks} | ${dryRun ? '⏸️ Skipped' : '🚀 Triggered'} |`).join('\n')
+              : '| - | No changes to process | - | - |'}
+
+            ${toArchive.length > 0 ? `
+            ### Ready to Archive (${toArchive.length})
+            ${toArchive.map(c => `- ✅ \`${c.id}\``).join('\n')}
+            ` : ''}
+            `;
+
+            await core.summary.addRaw(summary).write();
